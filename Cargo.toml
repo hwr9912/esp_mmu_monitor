@@ -1,0 +1,97 @@
+[package]
+edition = "2021"
+name = "esp32c6_test"
+rust-version = "1.88"
+version = "0.1.0"
+
+# --- 定义第一个程序：Wi-Fi 主程序 ---
+[[bin]]
+name = "wifi_app"            # 给编译出的固件起个名字 (运行时用)
+path = "src/bin/wifi_app.rs" # 对应的源文件路径
+
+# --- 定义第二个程序：温度测试程序 ---
+[[bin]]
+name = "temp_sensor"            # 给编译出的固件起个名字 (运行时用)
+path = "src/bin/temp_sensor.rs" # 对应的源文件路径
+
+# --- 定义最终程序：数据读取并上传 ---
+[[bin]]
+name = "final_app"            # 给编译出的固件起个名字 (运行时用)
+path = "src/bin/final_app.rs" # 对应的源文件路径
+
+[dependencies]
+# --- 核心 HAL (保留你原本能用的配置) ---
+esp-hal = { version = "1.0.0", features = ["defmt", "esp32c6", "unstable"] }
+esp-rtos = { version = "0.2.0", features = [
+  "defmt",
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32c6",
+] }
+esp-backtrace = { version = "0.18.1", features = [
+  "esp32c6",
+  "panic-handler",
+  "defmt",
+] }
+esp-println = { version = "0.16.1", features = [
+  "defmt-espflash",
+  "esp32c6",
+  "log-04",
+] }
+esp-alloc = { version = "0.9.0", features = ["defmt"] }
+
+# --- Wi-Fi 专用库 (原封不动保留) ---
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c6"] }
+embassy-net = { version = "0.7.1", features = [
+  "defmt",
+  "dhcpv4",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = { version = "0.7.1", features = ["defmt"] }
+embedded-io-async = { version = "0.7.0", features = ["defmt"] }
+# for more networking protocol support see https://crates.io/crates/edge-net
+embassy-executor = { version = "0.9.1", features = ["defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+esp-radio = { version = "0.17.0", features = [
+  "defmt",
+  "esp-alloc",
+  "esp32c6",
+  "smoltcp",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.12.0", default-features = false, features = [
+  "defmt",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+
+# --- 其他工具 ---
+defmt = "1.0.1"
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false
