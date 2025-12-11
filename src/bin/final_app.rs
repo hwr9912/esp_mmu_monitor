@@ -21,6 +21,7 @@ use esp_hal::{
     ram,
     rng::Rng,
     timer::timg::TimerGroup,
+    uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use esp_println::println;
 use esp_radio::{
@@ -163,7 +164,17 @@ async fn main(spawner: Spawner) -> ! {
     let one_wire_pin = Flex::new(peripherals.GPIO10);
     let mut sensor = OneWire::new(one_wire_pin, delay_driver);
 
-    // 4. 初始化 Wi-Fi
+    // 4. 初始化 CO2 传感器串口 (GPIO4 接 RX)
+    let uart_cfg = UartConfig::default()
+        .with_baudrate(9_600)
+        .with_data_bits(DataBits::_8)
+        .with_parity(Parity::None)
+        .with_stop_bits(StopBits::_1);
+    let mut co2_uart = Uart::new(peripherals.UART0, uart_cfg)
+        .unwrap()
+        .with_rx(peripherals.GPIO4);
+
+    // 5. 初始化 Wi-Fi
     let esp_radio_ctrl = &*mk_static!(Controller<'static>, esp_radio::init().unwrap());
     let (controller, interfaces) =
         esp_radio::wifi::new(&esp_radio_ctrl, peripherals.WIFI, Default::default()).unwrap();
@@ -253,7 +264,84 @@ async fn main(spawner: Spawner) -> ! {
             println!("Sensor not found!");
         }
 
-        // --- 步骤 B: 发送 HTTP 请求 ---
+        // --- 步骤 B: 读取 CO2，带简单超时避免卡死 ---
+        let mut co2_ppm: Option<u16> = None;
+        let mut frame = [0u8; 6];
+        let mut buf1 = [0u8; 1];
+
+        let mut waited_ms = 0;
+        while waited_ms < 2000 {
+            if let Ok(n) = co2_uart.read(&mut buf1) {
+                if n > 0 && buf1[0] == 0x2C {
+                    frame[0] = 0x2C;
+                    break;
+                }
+            }
+            Timer::after(Duration::from_millis(20)).await;
+            waited_ms += 20;
+        }
+
+        if frame[0] == 0x2C {
+            let mut frame_ok = true;
+            for i in 1..6 {
+                let mut byte_wait = 0;
+                loop {
+                    if let Ok(n) = co2_uart.read(&mut buf1) {
+                        if n > 0 {
+                            frame[i] = buf1[0];
+                            break;
+                        }
+                    }
+                    Timer::after(Duration::from_millis(20)).await;
+                    byte_wait += 20;
+                    if byte_wait >= 500 {
+                        frame_ok = false;
+                        println!("[WARN] CO2 读取第 {} 字节超时，放弃本轮。", i + 1);
+                        break;
+                    }
+                }
+                if !frame_ok {
+                    break;
+                }
+            }
+
+            if frame_ok {
+                let b1 = frame[0];
+                let b2 = frame[1];
+                let b3 = frame[2];
+                let b4 = frame[3];
+                let b5 = frame[4];
+                let b6 = frame[5];
+
+                if b4 != 0x03 || b5 != 0xFF {
+                    println!(
+                        "[WARN] CO2 满量程字段异常: b4=0x{:02X}, b5=0x{:02X}, frame={:02X?}",
+                        b4, b5, frame
+                    );
+                } else {
+                    let sum = b1
+                        .wrapping_add(b2)
+                        .wrapping_add(b3)
+                        .wrapping_add(b4)
+                        .wrapping_add(b5);
+
+                    if sum != b6 {
+                        println!(
+                            "[WARN] CO2 校验失败: 期望=0x{:02X}, 实际=0x{:02X}, frame={:02X?}",
+                            sum, b6, frame
+                        );
+                    } else {
+                        let value = ((b2 as u16) << 8) | (b3 as u16);
+                        co2_ppm = Some(value);
+                        println!("CO2 = {} ppm (帧: {:02X?})", value, frame);
+                    }
+                }
+            }
+        } else {
+            println!("[WARN] 未在 2 秒内捕获到 CO2 帧头，跳过本轮。");
+        }
+
+        // --- 步骤 C: 发送 HTTP 请求 ---
         if success {
             let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
             socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
@@ -266,11 +354,15 @@ async fn main(spawner: Spawner) -> ! {
                 Ok(_) => {
                     println!("Connected!");
 
+                    let co2_field = if let Some(v) = co2_ppm {
+                        format!("{}", v)
+                    } else {
+                        "null".into()
+                    };
+
                     // 1. 动态构建 JSON 内容
-                    let json_body = format!(
-                        "{{\"temp\":{:.2}, \"co2\":null, \"time\":null}}",
-                        temperature
-                    );
+                    let json_body =
+                        format!("{{\"temp\":{:.2}, \"co2\":{}}}", temperature, co2_field);
 
                     // 2. 动态构建 HTTP 请求头
                     // 注意：必须计算正确的 Content-Length，否则服务器可能不认
