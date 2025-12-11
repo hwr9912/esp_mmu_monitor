@@ -4,165 +4,108 @@
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
-    delay::Delay,
-    gpio::{Flex, Pull}, // 只需要 Flex 和 Pull
     main,
+    uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// --- 手写 1-Wire 驱动 (基于使能位切换) ---
-
-struct OneWire<'d> {
-    pin: Flex<'d>,
-    delay: Delay,
-}
-
-impl<'d> OneWire<'d> {
-    fn new(mut pin: Flex<'d>, delay: Delay) -> Self {
-        // 1. 预设输出电平为低。
-        // 以后我们只控制“输出开关”，不控制“输出电平”。
-        // 开关一开就是低，开关一关就是高阻（被电阻拉高）。
-        pin.set_low();
-
-        // 2. 开启输入功能 (永远开启，这样我们随时能读取线上的状态)
-        pin.set_input_enable(true);
-
-        // 3. 初始状态：关闭输出 (相当于释放总线，High)
-        pin.set_output_enable(false);
-
-        // 4. 尝试开启内部上拉 (可选)
-        // 既然你有板载电阻，如果这行报错，可以直接删掉。
-        // 在新版 HAL 中，通常是 set_pull
-        // pin.set_pull(Pull::Up);
-
-        Self { pin, delay }
-    }
-
-    // 动作：拉低总线
-    #[inline(always)]
-    fn drive_low(&mut self) {
-        // 打开输出使能 -> 因为 set_low() 了，所以引脚变低
-        self.pin.set_output_enable(true);
-    }
-
-    // 动作：释放总线
-    #[inline(always)]
-    fn release_high(&mut self) {
-        // 关闭输出使能 -> 引脚浮空 -> 被电阻拉高
-        self.pin.set_output_enable(false);
-    }
-
-    // 复位脉冲
-    fn reset(&mut self) -> bool {
-        critical_section::with(|_| {
-            self.drive_low();
-            self.delay.delay_micros(480); // 拉低 480us
-
-            self.release_high();
-            self.delay.delay_micros(70); // 释放后等待 70us 采样
-
-            // 因为 set_input_enable(true) 常开，直接读就行
-            let presence = self.pin.is_low();
-
-            self.delay.delay_micros(410); // 等待时隙结束
-            presence
-        })
-    }
-
-    // 写一个 Bit
-    fn write_bit(&mut self, bit: bool) {
-        critical_section::with(|_| {
-            self.drive_low(); // 开始：先拉低
-
-            if bit {
-                // 写 1: 拉低很短时间 (6us)，然后释放
-                self.delay.delay_micros(6);
-                self.release_high();
-                self.delay.delay_micros(64);
-            } else {
-                // 写 0: 拉低很长时间 (60us)
-                self.delay.delay_micros(60);
-                self.release_high();
-                self.delay.delay_micros(10);
-            }
-        });
-    }
-
-    // 读一个 Bit
-    fn read_bit(&mut self) -> bool {
-        critical_section::with(|_| {
-            self.drive_low(); // 开始：拉低
-            self.delay.delay_micros(6); // 保持 >1us
-
-            self.release_high(); // 释放
-            self.delay.delay_micros(9); // 等待数据稳定
-
-            let bit = self.pin.is_high(); // 采样
-
-            self.delay.delay_micros(55); // 等待时隙结束
-            bit
-        })
-    }
-
-    fn write_byte(&mut self, byte: u8) {
-        for i in 0..8 {
-            self.write_bit((byte >> i) & 0x01 != 0);
-        }
-    }
-
-    fn read_byte(&mut self) -> u8 {
-        let mut byte = 0;
-        for i in 0..8 {
-            if self.read_bit() {
-                byte |= 1 << i;
-            }
-        }
-        byte
-    }
-}
-
 #[main]
 fn main() -> ! {
+    // 跟你之前 temp_sensor.rs 一样的风格：用 esp_hal::Config 初始化
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    let delay = Delay::new();
-    let pin = Flex::new(peripherals.GPIO11); // 你的数据引脚
+    // 配置 UART：9600, 8N1，对应 CO2 模块协议
+    let uart_cfg = UartConfig::default()
+        .with_baudrate(9_600) // 9600 bps
+        .with_data_bits(DataBits::_8)
+        .with_parity(Parity::None)
+        .with_stop_bits(StopBits::_1);
 
-    let mut ow = OneWire::new(pin, delay);
+    // 用 UART0 + GPIO4 做 RX(模块 B 脚接这里，注意中间要分压)
+    //
+    // 注意：
+    // - 这个 API 是 esp-hal 1.0 系的，如果编译器说签名不对，
+    //   可以对照你当前版本的 Uart 示例，把 Config / with_rx 的写法调一下。
+    let mut uart = Uart::new(peripherals.UART0, uart_cfg)
+        .unwrap()
+        .with_rx(peripherals.GPIO4);
 
-    println!("DS18B20 Raw Enable-Bit Demo...");
+    println!("CO2 传感器读取程序启动，正在等待数据流...");
+
+    let mut frame = [0u8; 6];
+    let mut buf1 = [0u8; 1];
 
     loop {
-        // 1. 复位
-        if !ow.reset() {
-            println!("Sensor not found!");
-            ow.delay.delay_millis(1000);
+        // 1)先从串口里“捞”到一个 0x2C，当成帧头
+        loop {
+            if let Ok(n) = uart.read(&mut buf1) {
+                if n == 0 {
+                    // 当前没有数据，继续转一圈
+                    continue;
+                }
+
+                if buf1[0] == 0x2C {
+                    frame[0] = 0x2C;
+                    break;
+                }
+                // 否则丢掉，继续找下一个字节
+            }
+        }
+
+        // 2)已经拿到了 B1 = 0x2C，再读后面 5 个字节
+        for i in 1..6 {
+            loop {
+                if let Ok(n) = uart.read(&mut buf1) {
+                    if n == 0 {
+                        continue;
+                    } else {
+                        frame[i] = buf1[0];
+                        break;
+                    }
+                }
+            }
+        }
+
+        let b1 = frame[0];
+        let b2 = frame[1];
+        let b3 = frame[2];
+        let b4 = frame[3];
+        let b5 = frame[4];
+        let b6 = frame[5];
+
+        // 3)检查满量程字段是否是固定值 0x03, 0xFF
+        if b4 != 0x03 || b5 != 0xFF {
+            println!(
+                "CO2 帧满量程字段异常: b4=0x{:02X}, b5=0x{:02X}, frame={:02X?}",
+                b4, b5, frame
+            );
             continue;
         }
 
-        // 2. 发送指令
-        ow.write_byte(0xCC); // Skip ROM
-        ow.write_byte(0x44); // Convert T
+        // 4)Checksum 校验
+        let sum = b1
+            .wrapping_add(b2)
+            .wrapping_add(b3)
+            .wrapping_add(b4)
+            .wrapping_add(b5);
 
-        // 3. 等待转换
-        // DS18B20 转换时如果不接强上拉，拉低总线可能导致转换失败
-        // 所以我们这里只是死等，保持总线释放状态(High)
-        ow.delay.delay_millis(800);
+        if sum != b6 {
+            println!(
+                "CO2 校验失败: 期望=0x{:02X}, 实际=0x{:02X}, frame={:02X?}",
+                sum, b6, frame
+            );
+            continue;
+        }
 
-        // 4. 读取数据
-        ow.reset();
-        ow.write_byte(0xCC); // Skip ROM
-        ow.write_byte(0xBE); // Read Scratchpad
+        // 5)转换为 ppm
+        let co2_ppm: u16 = ((b2 as u16) << 8) | (b3 as u16);
 
-        let lsb = ow.read_byte();
-        let msb = ow.read_byte();
+        println!("CO2 = {} ppm (帧: {:02X?})", co2_ppm, frame);
 
-        let raw_temp = ((msb as u16) << 8) | (lsb as u16);
-        let temperature = raw_temp as f32 / 16.0;
-
-        println!("Temp: {:.2} C (Raw: {:04x})", temperature, raw_temp);
+        // 模块本身一般 1~2 秒发一帧，这里就不另外 delay 了，
+        // 想 10 秒打印一次的话，可以自己加一个计数器或者 Delay。
     }
 }

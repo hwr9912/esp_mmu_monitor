@@ -14,6 +14,11 @@ path = "src/bin/wifi_app.rs" # 对应的源文件路径
 name = "temp_sensor"            # 给编译出的固件起个名字 (运行时用)
 path = "src/bin/temp_sensor.rs" # 对应的源文件路径
 
+# --- 定义第三个程序：CO2测试程序 ---
+[[bin]]
+name = "co2_sensor"            # 给编译出的固件起个名字 (运行时用)
+path = "src/bin/co2_sensor.rs" # 对应的源文件路径
+
 # --- 定义最终程序：数据读取并上传 ---
 [[bin]]
 name = "final_app"            # 给编译出的固件起个名字 (运行时用)
